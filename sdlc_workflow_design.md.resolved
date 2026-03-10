@@ -6,6 +6,7 @@
 2. **Sequential** — One phase at a time, no context bloating
 3. **File-Tracked** — Progress persisted in `.story/<KEY>.md`, survives `/clear`
 4. **MCP-Powered** — Jira, GitHub, Figma as data sources (not duplicated)
+5. **Template-Driven** — Skills contain actual codebases, copy don't generate
 
 ---
 
@@ -32,7 +33,16 @@ User: /story PROJ-456
     Ask: "Ready     Ask: "Here's    Ask: "Design     Ask: "Tests    Ask: "Create
      to plan?"      my plan,        specs found,     pass, ready     PR and move
                     approve?"       proceed?"        for PR?"        to Review?"
+                        │
+                   Detects intent
+                        │
+              ┌─────────┼─────────┐
+              ▼         ▼         ▼
+         /react-mfe  /node-bff  /scaffold
+         (new proj)  (new proj)  (feature)
 ```
+
+---
 
 ## The State File: `.story/<KEY>.md`
 
@@ -73,7 +83,9 @@ Single source of truth across context resets:
 - [ ] deliver — PR + Jira transition
 ```
 
-## The Single Skill: `/story <KEY> [step]`
+---
+
+## The Story Skill: `/story <KEY> [step]`
 
 One router skill that reads the state file and picks up where it left off:
 
@@ -97,30 +109,44 @@ Execute the CURRENT step only, then stop and ask before next.
 1. Jira-MCP: get issue $0 (title, description, AC, type, linked issues)
 2. Jira-MCP: get parent epic for context
 3. Write findings to `.story/$0.md`
-4. Ask: "Here's the story. Ready to plan implementation?"
+4. Ask: "Here's the story. Ready to plan?"
 5. If yes → update status to "plan", stop
 
 ### Step: plan
 1. Research codebase (fork subagent, read-only)
    → Find files related to the AC
    → Identify patterns to follow
-2. Write proposed plan to `.story/$0.md`
-3. Ask: "Here's my plan. Approve, modify, or reject?"
-4. If approved → update status to "design", stop
+2. Detect intent from AC:
+
+   | AC mentions               | Suggest             |
+   |---------------------------|---------------------|
+   | "new micro-frontend/MFE"  | → /react-mfe        |
+   | "new BFF/API service"     | → /node-bff         |
+   | "new component"           | → /scaffold component|
+   | "new endpoint/route"      | → /scaffold api-route|
+   | "new page"                | → /scaffold page     |
+   | existing code changes     | → skip, straight to impl |
+
+3. If template needed → Ask: "This needs a new [type]. Create first?"
+   - Yes → invoke the skill → return here
+   - No → skip
+4. Write proposed plan to `.story/$0.md`
+5. Ask: "Plan ready. Approve, modify, or reject?"
+6. If approved → update status to "design", stop
 
 ### Step: design
 1. Check: does Jira story have a Figma link?
    - If yes → Figma-MCP: extract specs from linked frame
-   - If no → Ask: "No Figma link. Skip design or provide link?"
+   - If no → Ask: "No Figma link. Skip or provide link?"
 2. Write design specs to `.story/$0.md`
-3. Ask: "Design specs captured. Proceed to implement?"
+3. Ask: "Specs captured. Proceed to implement?"
 4. If yes → update status to "implement", stop
 
 ### Step: implement
 1. Read plan + specs from `.story/$0.md`
 2. Create branch if not exists: feature/$0-<slug>
 3. Implement ONE file at a time
-4. After each file → Ask: "File done. Continue next file or review?"
+4. After each file → Ask: "File done. Continue or review?"
 5. Run tests
 6. Ask: "Tests pass. Ready for PR?"
 7. If yes → update status to "deliver", stop
@@ -136,14 +162,207 @@ Execute the CURRENT step only, then stop and ask before next.
 5. Update status to "done"
 ```
 
+---
+
+## Template-Driven Project Skills
+
+Each skill folder **IS** the template — contains an actual working codebase that gets copied:
+
+### Project Templates
+
+```markdown
+# .claude/skills/react-mfe/SKILL.md
+---
+name: react-mfe
+description: Create React micro-frontend
+disable-model-invocation: true
+---
+1. Ask: "Project name?"
+2. Ask: "Target directory?" (default: ./)
+3. Check target directory for conflicts:
+   - If target is empty → proceed
+   - If target has files → list conflicts, Ask:
+     - "Overwrite all" — replace every conflicting file
+     - "Skip existing" — only copy files that don't exist
+     - "Backup & overwrite" — move existing to `.backup/` then copy
+     - "Abort" — stop, don't copy anything
+4. Copy `${CLAUDE_SKILL_DIR}/template/` to target (per conflict choice)
+5. In all files, replace `__PROJECT_NAME__` with given name
+6. Run `npm install`
+7. Ask: "Add integrations?" (Router / Zustand / TanStack Query / i18n)
+8. If any selected → install deps + add config
+9. Run `npm run dev` to verify
+```
+
+```markdown
+# .claude/skills/node-bff/SKILL.md
+---
+name: node-bff
+description: Create Node.js BFF/API service
+disable-model-invocation: true
+---
+1. Ask: "Service name?"
+2. Ask: "Target directory?" (default: ./)
+3. Check target for conflicts (same as react-mfe above)
+4. Copy `${CLAUDE_SKILL_DIR}/template/` to target (per conflict choice)
+5. Replace `__PROJECT_NAME__` in all files
+6. Run `npm install`
+7. Ask: "Add integrations?" (Prisma / Redis / Auth middleware)
+8. If any selected → install + configure
+9. Run `npm run dev` to verify
+```
+
+### Template Directory Structure
+
+```
+.claude/skills/react-mfe/
+├── SKILL.md                        ← Instructions (copy + customize)
+└── template/                       ← Actual working codebase
+    ├── package.json                ← __PROJECT_NAME__ placeholder
+    ├── tsconfig.json
+    ├── vite.config.ts
+    ├── biome.json
+    └── src/
+        ├── app/App.tsx
+        ├── features/.gitkeep
+        ├── shared/
+        │   ├── components/
+        │   ├── hooks/
+        │   └── utils/
+        ├── bootstrap.tsx
+        └── index.ts
+
+.claude/skills/node-bff/
+├── SKILL.md
+└── template/
+    ├── package.json
+    ├── tsconfig.json
+    ├── Dockerfile
+    └── src/
+        ├── routes/
+        ├── middleware/
+        ├── services/
+        └── index.ts
+```
+
+### Why Template-Driven > Instruction-Driven
+
+| Aspect | Instruction-driven | Template-driven |
+|--------|-------------------|-----------------|
+| Consistency | Varies each run | Identical base |
+| Context cost | High (generate) | Low (copy + replace) |
+| Speed | Slow | Fast |
+| Team standards | Hard to enforce | Baked in |
+| Versioning | N/A | Git-tracked, reviewable |
+
+### Conflict Resolution Strategy
+
+When template files conflict with existing files:
+
+| Scenario | Detection | Resolution |
+|----------|-----------|------------|
+| Target dir empty | No files in target | Copy all, no prompt |
+| Target has files | List overlapping filenames | Ask: overwrite / skip / backup / abort |
+| Single file exists | File with same name found | Ask: overwrite / skip / rename |
+| Config conflict | `package.json`, `tsconfig.json` exist | Ask: merge (deep) / overwrite / skip |
+| `.gitignore` exists | Common in all templates | Auto-merge (append unique lines) |
+
+**Merge logic for config files:**
+```
+- package.json → merge `dependencies` + `scripts` (keep existing, add new)
+- tsconfig.json → keep existing `compilerOptions`, add missing fields
+- biome.json → keep existing, warn if conflicts
+```
+
+---
+
+## Feature Scaffold Skills
+
+For adding pieces to an existing project (not new projects):
+
+```markdown
+# .claude/skills/scaffold/SKILL.md
+---
+name: scaffold
+description: Scaffold feature from template
+disable-model-invocation: true
+---
+1. Ask: "Type?" → component | api-route | page | model
+2. Ask: "Name?" (PascalCase for components, kebab for routes)
+3. Resolve target path (e.g. `src/components/__NAME__/`)
+4. Check for conflicts:
+   - If `__NAME__.tsx` already exists → Ask:
+     - "Overwrite" — replace file
+     - "Skip" — keep existing, only add missing files
+     - "Rename" — create as `__NAME__2` and let user merge
+     - "Abort" — cancel scaffold
+5. Copy `${CLAUDE_SKILL_DIR}/templates/<type>/` to target
+6. Replace `__NAME__` in filenames AND contents
+7. Ask: "Created. Customize props/fields?"
+```
+
+### Scaffold Templates
+
+```
+.claude/skills/scaffold/
+├── SKILL.md
+└── templates/
+    ├── component/
+    │   ├── __NAME__.tsx          ← Component with props interface
+    │   ├── __NAME__.test.tsx     ← Test with render check
+    │   ├── __NAME__.module.css   ← CSS module
+    │   └── index.ts              ← Barrel export
+    ├── api-route/
+    │   ├── __NAME__.handler.ts
+    │   ├── __NAME__.validation.ts
+    │   └── __NAME__.test.ts
+    └── page/
+        ├── __NAME__.page.tsx
+        └── __NAME__.loader.ts
+```
+
+---
+
+## Story Flow with Auto-Detection
+
+```
+/story PROJ-500
+
+  fetch → "Story: Create checkout micro-frontend"
+
+  plan  → Detects "new micro-frontend" in AC
+        → Ask: "This needs /react-mfe. Create first?"
+        → Yes
+            → /react-mfe
+            → Ask: "Name?" → "checkout-mfe"
+            → Copy template/ → ./checkout-mfe/
+            → Replace __PROJECT_NAME__ → checkout-mfe
+            → npm install
+            → Ask: "Integrations?" → Router + Zustand
+            → Done, back to /story
+        → Continue planning within new project
+
+  design → Figma-MCP: extract specs
+
+  impl  → Work inside scaffolded project
+        → /scaffold component CheckoutForm  ← template within project
+        → Customize with business logic + Figma specs
+        → Tests
+
+  deliver → GitHub-MCP: create PR → Jira-MCP: transition
+```
+
+---
+
 ## Context Management Strategy
 
 | Technique | Where Used |
 |-----------|-----------|
-| State file (`.story/`) | Persists across `/clear` — no need to re-fetch |
-| `context: fork` | Research step runs in isolated subagent |
-| `/clear` between steps | User can clear context; state file has everything |
-| Terse prompts | Each step reads only what it needs from state file |
+| State file (`.story/`) | Persists across `/clear` — no re-fetching |
+| `context: fork` | Research step in isolated subagent |
+| `${CLAUDE_SKILL_DIR}` | Portable template paths |
+| `/clear` between steps | User can reset; state file has everything |
+| Terse SKILL.md | Each step reads only what it needs |
 | One file at a time | Implement step codes ONE file, asks, then next |
 
 ## Resume After Context Reset
@@ -155,37 +374,55 @@ User: /story PROJ-456
 Claude reads .story/PROJ-456.md
   → status: "implement"
   → progress: 2/3 files done
-  → "Resuming PROJ-456. You're on the implement step, 2 of 3 files done."
-  → "Continue with the next file?"
+  → "Resuming PROJ-456. 2 of 3 files done."
+  → "Continue next file?"
 ```
 
 ## Human Gates Summary
 
 | Gate | Question | Options |
 |------|----------|---------|
-| After fetch | "Story fetched. Ready to plan?" | Yes / Clarify |
-| After plan | "Here's my plan. Approve?" | Approve / Modify / Reject |
-| After design | "Specs captured. Implement?" | Yes / Skip design / Provide link |
-| Each file | "File done. Continue?" | Next file / Review current / Stop |
-| After tests | "Tests pass. Create PR?" | Yes / Fix something / Add tests |
+| After fetch | "Ready to plan?" | Yes / Clarify |
+| Template detected | "Needs [type]. Create?" | Yes / No / Different type |
+| After plan | "Approve plan?" | Approve / Modify / Reject |
+| After design | "Specs captured. Implement?" | Yes / Skip / Provide link |
+| Each file | "File done. Continue?" | Next / Review / Stop |
+| After tests | "Tests pass. PR?" | Yes / Fix / Add tests |
 | After PR | "PR created, Jira updated." | Done / Add reviewers |
 
-## File Structure
+## Complete File Structure
 
 ```
 project/
-├── .story/                    ← Progress tracking
+├── .story/                            ← Progress tracking (gitignore optional)
 │   ├── PROJ-456.md
-│   ├── PROJ-457.md
-│   └── PROJ-458.md
+│   └── PROJ-457.md
 ├── .claude/
 │   ├── skills/
-│   │   └── story/
-│   │       └── SKILL.md       ← The main workflow
+│   │   ├── story/SKILL.md             ← SDLC flow (router)
+│   │   ├── react-mfe/                 ← Project template
+│   │   │   ├── SKILL.md
+│   │   │   └── template/              ← Actual codebase
+│   │   │       ├── package.json
+│   │   │       ├── src/...
+│   │   │       └── ...
+│   │   ├── node-bff/                  ← Project template
+│   │   │   ├── SKILL.md
+│   │   │   └── template/
+│   │   │       ├── package.json
+│   │   │       ├── src/...
+│   │   │       └── ...
+│   │   └── scaffold/                  ← Feature templates
+│   │       ├── SKILL.md
+│   │       └── templates/
+│   │           ├── component/
+│   │           ├── api-route/
+│   │           └── page/
 │   ├── rules/
-│   │   ├── typescript.md      ← Glob-matched rules
+│   │   ├── typescript.md              ← Glob-matched rules
 │   │   └── tests.md
-│   └── settings.json          ← Hooks
+│   └── settings.json                  ← Hooks
 └── src/
     └── ...
 ```
+
