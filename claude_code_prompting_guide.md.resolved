@@ -1,0 +1,415 @@
+# Claude Code Prompting: Askmetool, If-Else Workflows & Context Optimization
+
+## The Core Architecture
+
+Claude Code has **four pillars** for building intelligent, conditional workflows:
+
+| Pillar | What It Does | Where It Lives |
+|--------|-------------|----------------|
+| **CLAUDE.md** | Persistent project memory & rules | `./CLAUDE.md`, `~/.claude/CLAUDE.md` |
+| **Skills** | Reusable, parameterized workflows | `.claude/skills/<name>/SKILL.md` |
+| **Hooks** | Deterministic event-driven triggers | `.claude/settings.json` |
+| **Slash Commands** | User-invoked workflow shortcuts | `.claude/commands/<name>.md` |
+
+---
+
+## 1. The "Askmetool" Pattern — Interactive Decision-Making
+
+The "askmetool" pattern is about **asking the user a question before deciding which path to take**. In Claude Code, this is achieved by combining a skill's `SKILL.md` instructions with prompt-level branching.
+
+### How It Works
+
+```markdown
+# .claude/skills/smart-workflow/SKILL.md
+---
+name: smart-workflow
+description: Routes work based on user intent. Asks clarifying questions before executing.
+---
+
+When the user invokes this skill:
+
+1. **Ask the user**: "What type of change are you making?"
+   - 🆕 **New feature**
+   - 🐛 **Bug fix**
+   - ♻️ **Refactor**
+   - 📝 **Documentation**
+
+2. Based on their answer, follow the corresponding workflow:
+
+### If "New feature":
+   1. Create a feature branch from main
+   2. Scaffold boilerplate files using project conventions
+   3. Write tests first (TDD approach)
+   4. Implement the feature
+   5. Run lint + tests
+
+### If "Bug fix":
+   1. Ask: "What's the issue number or description?"
+   2. Read the relevant error logs or issue
+   3. Identify the root cause
+   4. Write a failing test that reproduces the bug
+   5. Fix the bug, verify the test passes
+
+### If "Refactor":
+   1. Ask: "Which module or file?"
+   2. Analyze the current code for code smells
+   3. Propose a refactoring plan before executing
+   4. Apply changes incrementally with tests passing at each step
+
+### If "Documentation":
+   1. Ask: "Which area needs docs?"
+   2. Read the relevant source code
+   3. Generate documentation following project conventions
+```
+
+> [!TIP]
+> The key insight: Claude naturally handles if-else branching when you **write it as explicit conditional instructions** in the SKILL.md. No code needed — just structured prose.
+
+---
+
+## 2. If-Else Conditions — Three Approaches
+
+### Approach A: Inline Conditional Instructions (CLAUDE.md / SKILL.md)
+
+Write branching logic directly in natural language:
+
+```markdown
+# CLAUDE.md
+
+## Workflow Rules
+
+When modifying files:
+- **If the file is in `src/api/`** → Run `npm run test:api` after changes
+- **If the file is in `src/ui/`** → Run `npm run test:ui` and take a screenshot
+- **If the file is a `.sql` file** → Run migration validation script
+- **If creating a new component** → Use the template at `templates/component.tsx`
+- **Otherwise** → Run the full test suite
+```
+
+### Approach B: Hooks for Deterministic Conditionals
+
+Hooks **guarantee execution** (unlike CLAUDE.md which Claude *may* follow). Use them when the conditional logic must be enforced:
+
+```json
+// .claude/settings.json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": { "tool_name": "Bash" },
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"decision\": \"block\", \"reason\": \"Use npm scripts instead of raw shell commands for builds\"}' | jq -r . 2>/dev/null || echo 'blocked'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": { "tool_name": "Write" },
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$HOOK_FILE_PATH\" == *.ts ]]; then npx prettier --write \"$HOOK_FILE_PATH\"; fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": {},
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "Review Claude's output. If it contains TODO comments, return {\"decision\": \"reject\", \"reason\": \"No TODO comments allowed. Complete the implementation.\"}. Otherwise return {\"decision\": \"approve\"}."
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+> [!IMPORTANT]
+> **Hooks vs CLAUDE.md**: Hooks are *deterministic* — they always fire. CLAUDE.md rules are *suggestions* — Claude follows them most of the time but can deviate. Use hooks for **enforcement**, CLAUDE.md for **guidance**.
+
+### Approach C: Multi-Skill Router (The Dispatcher Pattern)
+
+Create a **router skill** that acts as a dispatcher:
+
+```markdown
+# .claude/skills/route/SKILL.md
+---
+name: route
+description: Intelligent task router. Determines the right workflow and delegates.
+disable-model-invocation: true
+---
+
+Analyze the user's request: "$ARGUMENTS"
+
+Classify into ONE category and execute the matching workflow:
+
+**Category: "test"** → Run `/run-tests $ARGUMENTS`
+**Category: "deploy"** → Run `/deploy $ARGUMENTS`
+**Category: "review"** → Run `/code-review $ARGUMENTS`
+**Category: "docs"** → Run `/generate-docs $ARGUMENTS`
+**Category: "debug"** → Run `/debug $ARGUMENTS`
+
+If unclear, ask the user to clarify before proceeding.
+```
+
+Each target skill is self-contained:
+
+```markdown
+# .claude/skills/run-tests/SKILL.md
+---
+name: run-tests
+description: Runs the appropriate test suite
+disable-model-invocation: true
+---
+Based on $ARGUMENTS, determine the test scope:
+- If a filename is given → run tests for that file only
+- If "all" or no argument → run the full suite
+- If "changed" → run tests only for git-changed files
+```
+
+---
+
+## 3. Context Optimization Strategies
+
+Context window usage is the #1 performance bottleneck. Here's how to keep it lean:
+
+### Strategy 1: Progressive Skill Loading
+
+Skills use **lazy loading** — only the `name` and `description` from frontmatter are loaded initially. Full instructions load only when the skill is invoked.
+
+```
+# What Claude sees at startup (tiny footprint):
+- smart-workflow: "Routes work based on user intent"
+- run-tests: "Runs the appropriate test suite"
+- deploy: "Deploy the application"
+
+# Full SKILL.md content only loads when /smart-workflow is invoked
+```
+
+### Strategy 2: Subagent Isolation (`context: fork`)
+
+Run heavy tasks in isolated contexts so they don't pollute your main conversation:
+
+```markdown
+# .claude/skills/deep-research/SKILL.md
+---
+name: deep-research
+description: Research a topic by reading many files
+context: fork
+agent: Explore
+allowed-tools: Read, Grep, Glob
+---
+Research "$ARGUMENTS" thoroughly:
+1. Find relevant files using Glob and Grep
+2. Read and analyze the code
+3. Return a summary with specific file references
+```
+
+> [!TIP]
+> `context: fork` creates a **fresh context** for the subagent. The main conversation only receives a summary of findings, keeping its context clean.
+
+### Strategy 3: Dynamic Context Injection (`!command`)
+
+Instead of loading large files into CLAUDE.md, inject context **on demand**:
+
+```markdown
+# .claude/skills/pr-review/SKILL.md
+---
+name: pr-review
+description: Review the current pull request
+context: fork
+agent: Explore
+---
+## PR Context (injected dynamically)
+- Diff: !`gh pr diff`
+- Changed files: !`gh pr diff --name-only`
+- PR description: !`gh pr view --json body -q .body`
+
+## Task
+Review this PR for: correctness, performance, security, and style.
+```
+
+The `!command` syntax executes **before Claude sees the prompt** — results replace the placeholder inline.
+
+### Strategy 4: Compact CLAUDE.md with Imports
+
+Keep CLAUDE.md small by using `@imports`:
+
+```markdown
+# CLAUDE.md (lean — ~20 lines)
+See @README.md for project overview.
+See @docs/architecture.md for system design.
+See @package.json for available scripts.
+
+## Key Rules
+- Use TypeScript strict mode
+- Run `npm test` before committing
+- API handlers go in `src/api/handlers/`
+- Use 2-space indentation
+```
+
+### Strategy 5: File-Glob Rules (`.claude/rules/`)
+
+Instead of one massive CLAUDE.md, split rules by file type:
+
+```markdown
+# .claude/rules/typescript.md
+---
+globs: ["*.ts", "*.tsx"]
+---
+- Use strict TypeScript, no `any`
+- Prefer `interface` over `type` for object shapes
+- Use barrel exports via `index.ts`
+```
+
+```markdown
+# .claude/rules/tests.md
+---
+globs: ["*.test.ts", "*.spec.ts"]
+---
+- Use Vitest, not Jest
+- Every test must have a descriptive name
+- Use `describe` blocks to group related tests
+```
+
+These only load when Claude touches matching files — **zero context cost otherwise**.
+
+---
+
+## 4. 💡 Workflow Ideas
+
+Here are concrete, ready-to-implement workflow ideas combining all the patterns:
+
+### Idea 1: Smart Commit Workflow
+```
+/commit → asks "type?" (feat/fix/refactor/docs/chore)
+       → runs tests for changed files only
+       → generates conventional commit message
+       → if tests fail → asks "fix or commit anyway?"
+```
+
+### Idea 2: Issue-Driven Development
+```
+/issue 123 → fetches issue from GitHub
+           → if bug → searches codebase for related code
+           → if feature → scaffolds files from template
+           → creates branch, implements, tests, PR
+```
+
+### Idea 3: Review Gate (Hook-based)
+```
+Stop hook → prompt-based check:
+         → if output has TODOs → reject, ask to complete
+         → if output has hardcoded secrets → reject
+         → if output is a new API → check OpenAPI spec compliance
+         → otherwise → approve
+```
+
+### Idea 4: Environment-Aware Deployment
+```
+/deploy $env → if "staging" → build + deploy to staging
+             → if "production" → require confirmation
+                               → run full test suite
+                               → build + deploy
+                               → run smoke tests
+                               → if smoke fails → auto-rollback
+             → if "local" → just docker-compose up
+```
+
+### Idea 5: Adaptive Code Style Enforcer
+```
+PostToolUse hook on Write:
+  → if .py file → run black + ruff
+  → if .ts file → run prettier + eslint
+  → if .go file → run gofmt
+  → if .rs file → run cargo fmt
+```
+
+### Idea 6: Learning Assistant
+```
+/explain $file → asks "depth?" (overview / detailed / teach-me)
+              → if overview → 3-line summary
+              → if detailed → line-by-line walkthrough + diagram
+              → if teach-me → analogy + diagram + quiz
+```
+
+### Idea 7: Context-Aware PR Creator
+```
+/pr → fork subagent:
+    → read git diff
+    → classify: bug fix? feature? refactor?
+    → generate PR title + description
+    → if breaking change → add warning label
+    → create PR with appropriate labels + reviewers
+```
+
+### Idea 8: Database Migration Safety Net
+```
+PreToolUse hook on Bash:
+  → if command contains "migrate" or "prisma db push":
+    → check if on main branch → block
+    → check if backup exists → warn
+    → otherwise → allow with logged audit trail
+```
+
+### Idea 9: Multi-Framework Component Generator
+```
+/component Button → asks "framework?" (React/Vue/Svelte)
+                  → asks "variant?" (primary/secondary/ghost)
+                  → generates component + stories + tests
+                  → uses framework-specific skill for each
+```
+
+### Idea 10: Intelligent Debug Loop
+```
+/debug "tests failing" → run tests → capture output
+                       → if timeout → suggest async fixes
+                       → if assertion error → show diff of expected vs actual
+                       → if import error → check dependencies
+                       → propose fix → apply → re-run → repeat until green
+```
+
+---
+
+## 5. Putting It All Together — Architecture
+
+```mermaid
+graph TD
+    A["User Prompt"] --> B{"UserPromptSubmit Hook"}
+    B -->|blocked| C["Reject & Explain"]
+    B -->|allowed| D["CLAUDE.md Rules Loaded"]
+    D --> E{"Skill Invoked?"}
+    E -->|/route cmd| F["Router Skill"]
+    F --> G{"Classify Intent"}
+    G -->|test| H["/run-tests"]
+    G -->|deploy| I["/deploy"]
+    G -->|review| J["/code-review"]
+    G -->|unclear| K["Ask User"]
+    E -->|auto-triggered| L["Context-Matched Skill"]
+    E -->|no| M["Direct Response"]
+    H & I & J & L --> N{"PostToolUse Hook"}
+    N --> O["Format / Lint / Validate"]
+    O --> P{"Stop Hook"}
+    P -->|approve| Q["✅ Done"]
+    P -->|reject| R["Revise & Retry"]
+```
+
+---
+
+## Quick Reference
+
+| Pattern | Best For | Mechanism |
+|---------|----------|-----------|
+| Askmetool (interactive branching) | User-driven decisions | SKILL.md with if-else prose |
+| Deterministic enforcement | Safety rules, formatting | Hooks (`PreToolUse`, `PostToolUse`, `Stop`) |
+| Task routing | Delegating to sub-workflows | Router skill + target skills |
+| Context optimization | Large codebases | `context: fork`, `!command`, `@imports`, `.claude/rules/` |
+| Event-driven automation | Auto-format, auto-test | Hooks on `PostToolUse(Write)` |
+| Prompt-based checks | Nuanced judgment calls | `type: "prompt"` hooks on `Stop` |

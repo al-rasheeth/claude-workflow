@@ -1,0 +1,191 @@
+# SDLC Workflow Design: Sequential, Human-Gated, File-Tracked
+
+## Design Principles
+
+1. **Human-In-The-Flow** — AskUserQuestion at every gate, no autonomous leaps
+2. **Sequential** — One phase at a time, no context bloating
+3. **File-Tracked** — Progress persisted in `.story/<KEY>.md`, survives `/clear`
+4. **MCP-Powered** — Jira, GitHub, Figma as data sources (not duplicated)
+
+---
+
+## Architecture
+
+```
+User: /story PROJ-456
+
+┌─────────────────────────────────────────────────┐
+│            .story/PROJ-456.md (state file)       │
+│  status: fetch → plan → design → impl → deliver │
+│  current_step: plan                              │
+│  branch: feature/PROJ-456-card-component         │
+│  files_changed: [src/Card.tsx, src/Card.test.tsx] │
+└─────────────────────────────────────────────────┘
+        │
+        │  Read by each step, updated after each step
+        ▼
+  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │  FETCH   │───▶│   PLAN   │───▶│  DESIGN  │───▶│  IMPL    │───▶│ DELIVER  │
+  │ (Jira)   │    │(Research)│    │ (Figma)  │    │ (Code)   │    │(PR+Jira) │
+  └──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+       │               │               │               │               │
+    Ask: "Ready     Ask: "Here's    Ask: "Design     Ask: "Tests    Ask: "Create
+     to plan?"      my plan,        specs found,     pass, ready     PR and move
+                    approve?"       proceed?"        for PR?"        to Review?"
+```
+
+## The State File: `.story/<KEY>.md`
+
+Single source of truth across context resets:
+
+```markdown
+# PROJ-456: Add user card component
+
+## Meta
+- **Jira**: PROJ-456
+- **Epic**: PROJ-400 (User Profile)
+- **Type**: Story
+- **Status**: implementing ← current step
+- **Branch**: feature/PROJ-456-card-component
+
+## Acceptance Criteria (from Jira)
+- [ ] Card displays user avatar, name, role
+- [ ] Card has hover animation
+- [ ] Responsive: stack on mobile
+
+## Design Specs (from Figma)
+- Padding: 16px
+- Border-radius: 12px
+- Colors: primary #3B82F6, bg #F8FAFC
+- Font: Inter 14px/16px
+
+## Plan (approved)
+1. Create `src/components/UserCard/UserCard.tsx`
+2. Create `src/components/UserCard/UserCard.test.tsx`
+3. Update `src/components/index.ts` barrel export
+4. Add to Dashboard page
+
+## Progress
+- [x] fetch — Story fetched from Jira
+- [x] plan — Plan approved by user
+- [x] design — Figma specs extracted
+- [/] implement — 2/3 files done
+- [ ] deliver — PR + Jira transition
+```
+
+## The Single Skill: `/story <KEY> [step]`
+
+One router skill that reads the state file and picks up where it left off:
+
+```markdown
+# .claude/skills/story/SKILL.md
+---
+name: story
+description: SDLC story executor with human gates
+disable-model-invocation: true
+---
+
+Read `.story/$ARGUMENTS[0].md` to find current status.
+If no file exists, start from "fetch".
+If a step argument is given ($ARGUMENTS[1]), jump to that step.
+
+Execute the CURRENT step only, then stop and ask before next.
+
+## Steps
+
+### Step: fetch
+1. Jira-MCP: get issue $0 (title, description, AC, type, linked issues)
+2. Jira-MCP: get parent epic for context
+3. Write findings to `.story/$0.md`
+4. Ask: "Here's the story. Ready to plan implementation?"
+5. If yes → update status to "plan", stop
+
+### Step: plan
+1. Research codebase (fork subagent, read-only)
+   → Find files related to the AC
+   → Identify patterns to follow
+2. Write proposed plan to `.story/$0.md`
+3. Ask: "Here's my plan. Approve, modify, or reject?"
+4. If approved → update status to "design", stop
+
+### Step: design
+1. Check: does Jira story have a Figma link?
+   - If yes → Figma-MCP: extract specs from linked frame
+   - If no → Ask: "No Figma link. Skip design or provide link?"
+2. Write design specs to `.story/$0.md`
+3. Ask: "Design specs captured. Proceed to implement?"
+4. If yes → update status to "implement", stop
+
+### Step: implement
+1. Read plan + specs from `.story/$0.md`
+2. Create branch if not exists: feature/$0-<slug>
+3. Implement ONE file at a time
+4. After each file → Ask: "File done. Continue next file or review?"
+5. Run tests
+6. Ask: "Tests pass. Ready for PR?"
+7. If yes → update status to "deliver", stop
+
+### Step: deliver
+1. GitHub-MCP: create PR
+   - Title: from Jira story title
+   - Body: AC checklist + Figma link
+   - Branch: from state file
+2. Jira-MCP: transition to "In Review"
+3. Jira-MCP: add comment with PR link
+4. Ask: "PR created, Jira updated. Done!"
+5. Update status to "done"
+```
+
+## Context Management Strategy
+
+| Technique | Where Used |
+|-----------|-----------|
+| State file (`.story/`) | Persists across `/clear` — no need to re-fetch |
+| `context: fork` | Research step runs in isolated subagent |
+| `/clear` between steps | User can clear context; state file has everything |
+| Terse prompts | Each step reads only what it needs from state file |
+| One file at a time | Implement step codes ONE file, asks, then next |
+
+## Resume After Context Reset
+
+```
+User: /clear
+User: /story PROJ-456
+
+Claude reads .story/PROJ-456.md
+  → status: "implement"
+  → progress: 2/3 files done
+  → "Resuming PROJ-456. You're on the implement step, 2 of 3 files done."
+  → "Continue with the next file?"
+```
+
+## Human Gates Summary
+
+| Gate | Question | Options |
+|------|----------|---------|
+| After fetch | "Story fetched. Ready to plan?" | Yes / Clarify |
+| After plan | "Here's my plan. Approve?" | Approve / Modify / Reject |
+| After design | "Specs captured. Implement?" | Yes / Skip design / Provide link |
+| Each file | "File done. Continue?" | Next file / Review current / Stop |
+| After tests | "Tests pass. Create PR?" | Yes / Fix something / Add tests |
+| After PR | "PR created, Jira updated." | Done / Add reviewers |
+
+## File Structure
+
+```
+project/
+├── .story/                    ← Progress tracking
+│   ├── PROJ-456.md
+│   ├── PROJ-457.md
+│   └── PROJ-458.md
+├── .claude/
+│   ├── skills/
+│   │   └── story/
+│   │       └── SKILL.md       ← The main workflow
+│   ├── rules/
+│   │   ├── typescript.md      ← Glob-matched rules
+│   │   └── tests.md
+│   └── settings.json          ← Hooks
+└── src/
+    └── ...
+```
